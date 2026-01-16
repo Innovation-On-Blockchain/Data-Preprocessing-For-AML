@@ -1,0 +1,44 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+config.toml
+secrets/
+
+# Data files (large, generated)
+data/
+*.parquet
+*.csv
+*.json
+!package.json
+!Cargo.toml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Python artifacts (for downstream training)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
