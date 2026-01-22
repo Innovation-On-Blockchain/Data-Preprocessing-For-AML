@@ -48,7 +48,7 @@ pub struct TimeWindowConfig {
 impl Default for TimeWindowConfig {
     fn default() -> Self {
         let end = Utc::now();
-        let start = end - Duration::weeks(8);
+        let start = end - Duration::weeks(52); // 1 year for comprehensive coverage
         Self { start, end }
     }
 }
@@ -153,19 +153,19 @@ fn default_alchemy_url() -> String {
 }
 
 fn default_rps() -> u32 {
-    25 // Conservative for free tier
+    10 // Conservative to avoid 429 errors on large-scale collection
 }
 
 fn default_batch_size() -> usize {
-    100
+    50 // Smaller batches for reliability
 }
 
 fn default_max_retries() -> u32 {
-    5
+    10 // More retries for long-running jobs
 }
 
 fn default_base_delay_ms() -> u64 {
-    1000
+    2000 // Longer base delay for backoff
 }
 
 fn default_data_dir() -> PathBuf {
@@ -272,27 +272,27 @@ pub enum CounterpartyRanking {
 
 // Scale control defaults
 fn default_top_k_counterparties() -> usize {
-    200 // Balance between coverage and scale
+    500 // Higher coverage for large-scale collection
 }
 
 fn default_max_nodes() -> usize {
-    200_000 // Upper bound for V2 target
+    500_000 // Increased for ~250K suspicious addresses + counterparties
 }
 
 fn default_max_edges() -> usize {
-    10_000_000 // Upper bound for V2 target
+    50_000_000 // Increased for large-scale graph
 }
 
 fn default_min_labeled() -> usize {
-    10 // Minimum viable for training
+    1 // Allow even single address for testing
 }
 
 fn default_max_labeled() -> usize {
-    500 // Upper bound per spec
+    250_000 // ~250K suspicious addresses cap (or all from OFAC, whichever is smaller)
 }
 
 fn default_max_weeks() -> i64 {
-    12 // Hard cap on time window
+    52 // Full year of data
 }
 
 fn default_strict_bounds() -> bool {

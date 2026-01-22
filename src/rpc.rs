@@ -113,8 +113,9 @@ impl EthRpcClient {
         let semaphore = Arc::new(Semaphore::new(config.batch_size));
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(10)
+            .timeout(Duration::from_secs(120)) // Longer timeout for large responses
+            .pool_max_idle_per_host(20)
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -141,8 +142,9 @@ impl EthRpcClient {
     ) -> Result<R, RpcError> {
         let backoff = ExponentialBackoffBuilder::default()
             .with_initial_interval(Duration::from_millis(self.config.base_delay_ms))
-            .with_max_interval(Duration::from_secs(30))
-            .with_max_elapsed_time(Some(Duration::from_secs(120)))
+            .with_max_interval(Duration::from_secs(60)) // Longer max interval for 429s
+            .with_max_elapsed_time(Some(Duration::from_secs(300))) // 5 min total retry time
+            .with_multiplier(2.0) // Double the delay each retry
             .build();
 
         let op = || async {

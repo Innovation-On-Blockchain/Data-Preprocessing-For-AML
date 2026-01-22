@@ -60,12 +60,12 @@ enum Commands {
         #[arg(short, long, default_value = "transactions_raw.parquet")]
         output: String,
 
-        /// Time window in weeks (max 12)
-        #[arg(short, long, default_value = "8")]
+        /// Time window in weeks (max 52)
+        #[arg(short, long, default_value = "52")]
         weeks: i64,
 
         /// Top-K counterparties per labeled address
-        #[arg(short = 'k', long, default_value = "200")]
+        #[arg(short = 'k', long, default_value = "500")]
         top_k: usize,
 
         /// Fail if scale limits exceeded (otherwise just warn)
@@ -105,12 +105,12 @@ enum Commands {
 
     /// Run the complete pipeline
     Run {
-        /// Time window in weeks (max 12)
-        #[arg(short, long, default_value = "8")]
+        /// Time window in weeks (max 52)
+        #[arg(short, long, default_value = "52")]
         weeks: i64,
 
         /// Top-K counterparties per labeled address
-        #[arg(short = 'k', long, default_value = "200")]
+        #[arg(short = 'k', long, default_value = "500")]
         top_k: usize,
 
         /// Skip transaction fetching (use existing data)
