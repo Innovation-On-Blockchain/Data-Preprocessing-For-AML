@@ -60,8 +60,8 @@ enum Commands {
         #[arg(short, long, default_value = "transactions_raw.parquet")]
         output: String,
 
-        /// Time window in weeks (max 52)
-        #[arg(short, long, default_value = "52")]
+        /// Time window in weeks (max 600, default=all history since Ethereum genesis 2015)
+        #[arg(short, long, default_value = "600")]
         weeks: i64,
 
         /// Top-K counterparties per labeled address
@@ -105,8 +105,8 @@ enum Commands {
 
     /// Run the complete pipeline
     Run {
-        /// Time window in weeks (max 52)
-        #[arg(short, long, default_value = "52")]
+        /// Time window in weeks (max 600, default=all history since Ethereum genesis 2015)
+        #[arg(short, long, default_value = "600")]
         weeks: i64,
 
         /// Top-K counterparties per labeled address

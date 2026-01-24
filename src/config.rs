@@ -2,9 +2,12 @@
 //!
 //! Supports loading from environment variables, config files, and CLI arguments.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Ethereum mainnet genesis block timestamp: July 30, 2015 15:26:13 UTC
+pub const ETHEREUM_GENESIS_TIMESTAMP: &str = "2015-07-30T15:26:13Z";
 
 /// Main pipeline configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +51,8 @@ pub struct TimeWindowConfig {
 impl Default for TimeWindowConfig {
     fn default() -> Self {
         let end = Utc::now();
-        let start = end - Duration::weeks(52); // 1 year for comprehensive coverage
+        // Start from Ethereum genesis: July 30, 2015
+        let start = Utc.with_ymd_and_hms(2015, 7, 30, 15, 26, 13).unwrap();
         Self { start, end }
     }
 }
@@ -292,7 +296,7 @@ fn default_max_labeled() -> usize {
 }
 
 fn default_max_weeks() -> i64 {
-    52 // Full year of data
+    600 // ~11.5 years - covers entire Ethereum history since genesis
 }
 
 fn default_strict_bounds() -> bool {
@@ -311,8 +315,8 @@ impl ScaleConfig {
         if self.max_edges < 10000 {
             anyhow::bail!("max_edges must be >= 10000");
         }
-        if self.max_time_window_weeks < 1 || self.max_time_window_weeks > 52 {
-            anyhow::bail!("max_time_window_weeks must be between 1 and 52");
+        if self.max_time_window_weeks < 1 || self.max_time_window_weeks > 600 {
+            anyhow::bail!("max_time_window_weeks must be between 1 and 600");
         }
         Ok(())
     }
@@ -420,13 +424,18 @@ impl PipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn test_default_time_window() {
         let tw = TimeWindowConfig::default();
         assert!(tw.end > tw.start);
-        // Should be approximately 8 weeks
+        // Should start from Ethereum genesis (July 30, 2015) - roughly 500+ weeks
         let diff = tw.end - tw.start;
-        assert!(diff.num_weeks() >= 7 && diff.num_weeks() <= 9);
+        assert!(diff.num_weeks() >= 500, "Expected >= 500 weeks since Ethereum genesis");
+        // Start should be July 30, 2015
+        assert_eq!(tw.start.year(), 2015);
+        assert_eq!(tw.start.month(), 7);
+        assert_eq!(tw.start.day(), 30);
     }
 }
