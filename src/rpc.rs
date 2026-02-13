@@ -1,14 +1,14 @@
-//! Ethereum JSON-RPC client with rate limiting and retry logic.
+//! Ethereum JSON-RPC client with rate limiting, key rotation, and retry logic.
 //!
 //! Provides a robust wrapper around Alchemy RPC with:
 //! - Rate limiting (compute units aware)
-//! - Exponential backoff with jitter
+//! - Automatic API key rotation on 429 rate-limit errors
+//! - Infinite exponential backoff (the program never exits on transient errors)
 //! - Batch request support
 //! - Proper error handling
 
-use crate::config::RateLimitConfig;
+use crate::config::{AlchemyKeyPool, RateLimitConfig};
 use alloy_primitives::{Address, Bytes, TxHash, U256};
-use backoff::ExponentialBackoffBuilder;
 use governor::{Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
@@ -90,10 +90,11 @@ pub struct Transaction {
     pub input: Bytes,
 }
 
-/// Rate-limited Ethereum RPC client
+/// Rate-limited Ethereum RPC client with key rotation.
 pub struct EthRpcClient {
     client: reqwest::Client,
-    rpc_url: String,
+    base_url: String,
+    key_pool: AlchemyKeyPool,
     rate_limiter: RateLimiter<
         governor::state::NotKeyed,
         governor::state::InMemoryState,
@@ -105,15 +106,17 @@ pub struct EthRpcClient {
 }
 
 impl EthRpcClient {
-    pub fn new(rpc_url: String, config: RateLimitConfig) -> Self {
-        let quota = Quota::per_second(NonZeroU32::new(config.requests_per_second).unwrap());
+    pub fn new(base_url: String, key_pool: AlchemyKeyPool, config: RateLimitConfig) -> Self {
+        let quota = Quota::per_second(
+            NonZeroU32::new(config.requests_per_second).unwrap_or(NonZeroU32::new(1).unwrap()),
+        );
         let rate_limiter = RateLimiter::direct(quota);
 
         // Concurrent request limit
-        let semaphore = Arc::new(Semaphore::new(config.batch_size));
+        let semaphore = Arc::new(Semaphore::new(config.batch_size.max(1)));
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120)) // Longer timeout for large responses
+            .timeout(Duration::from_secs(120))
             .pool_max_idle_per_host(20)
             .tcp_keepalive(Duration::from_secs(30))
             .build()
@@ -121,7 +124,8 @@ impl EthRpcClient {
 
         Self {
             client,
-            rpc_url,
+            base_url,
+            key_pool,
             rate_limiter,
             semaphore,
             config,
@@ -129,26 +133,45 @@ impl EthRpcClient {
         }
     }
 
+    /// Build the full RPC URL using the current active key.
+    fn rpc_url(&self) -> String {
+        format!("{}/{}", self.base_url, self.key_pool.current_key())
+    }
+
     fn next_id(&self) -> u64 {
         self.request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Make a single RPC call with retry logic
+    /// Determine if an error is transient (should be retried).
+    fn is_transient_error(code: i64, message: &str) -> bool {
+        // -32005 = rate limit / resource unavailable
+        // -32603 = internal JSON-RPC error (often transient on Alchemy)
+        // -32000 = server error (often transient)
+        matches!(code, -32005 | -32603 | -32000)
+            || message.to_lowercase().contains("rate")
+            || message.to_lowercase().contains("limit")
+            || message.to_lowercase().contains("capacity")
+            || message.to_lowercase().contains("temporarily")
+            || message.to_lowercase().contains("timeout")
+    }
+
+    /// Make a single RPC call with **infinite** retry + key rotation.
+    /// This method will NEVER return an error for transient failures;
+    /// it keeps retrying with exponential backoff and key rotation forever.
     async fn call<P: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
         params: P,
     ) -> Result<R, RpcError> {
-        let backoff = ExponentialBackoffBuilder::default()
-            .with_initial_interval(Duration::from_millis(self.config.base_delay_ms))
-            .with_max_interval(Duration::from_secs(60)) // Longer max interval for 429s
-            .with_max_elapsed_time(Some(Duration::from_secs(300))) // 5 min total retry time
-            .with_multiplier(2.0) // Double the delay each retry
-            .build();
+        let mut delay = Duration::from_millis(self.config.base_delay_ms);
+        let max_delay = Duration::from_secs(120);
+        let mut attempt: u64 = 0;
 
-        let op = || async {
-            // Wait for rate limit
+        loop {
+            attempt += 1;
+
+            // Wait for rate limiter
             self.rate_limiter.until_ready().await;
 
             let _permit = self.semaphore.acquire().await.unwrap();
@@ -160,57 +183,104 @@ impl EthRpcClient {
                 id: self.next_id(),
             };
 
-            let response = self
+            let url = self.rpc_url();
+
+            let send_result = self
                 .client
-                .post(&self.rpc_url)
+                .post(&url)
                 .json(&request)
                 .send()
-                .await
-                .map_err(|e| {
-                    if e.is_timeout() || e.is_connect() {
-                        backoff::Error::transient(RpcError::Http(e))
-                    } else {
-                        backoff::Error::permanent(RpcError::Http(e))
-                    }
-                })?;
+                .await;
 
-            if response.status() == 429 {
-                warn!("Rate limited, backing off...");
-                return Err(backoff::Error::transient(RpcError::RateLimitExceeded));
+            let response = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Network error — always transient, rotate key and retry
+                    warn!(
+                        "[attempt {}] Network error on {}: {} — rotating key and retrying in {:?}",
+                        attempt, method, e, delay
+                    );
+                    self.key_pool.rotate();
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                    continue;
+                }
+            };
+
+            // Handle HTTP 429 — rotate key and retry
+            if response.status().as_u16() == 429 {
+                warn!(
+                    "[attempt {}] HTTP 429 rate limited on {} — rotating key and retrying in {:?}",
+                    attempt, method, delay
+                );
+                self.key_pool.rotate();
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(max_delay);
+                continue;
             }
 
-            let json_response: JsonRpcResponse<R> =
-                response.json().await.map_err(|e| {
-                    backoff::Error::permanent(RpcError::Http(e))
-                })?;
+            // Handle other HTTP errors
+            if response.status().is_server_error() {
+                warn!(
+                    "[attempt {}] HTTP {} on {} — retrying in {:?}",
+                    attempt, response.status(), method, delay
+                );
+                self.key_pool.rotate();
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(max_delay);
+                continue;
+            }
 
-            if let Some(error) = json_response.error {
-                // Some errors are transient
-                if error.code == -32005 || error.message.contains("rate") {
-                    return Err(backoff::Error::transient(RpcError::JsonRpc {
-                        code: error.code,
-                        message: error.message,
-                    }));
+            // Parse JSON
+            let json_response: JsonRpcResponse<R> = match response.json().await {
+                Ok(j) => j,
+                Err(e) => {
+                    warn!(
+                        "[attempt {}] Failed to parse JSON for {}: {} — retrying in {:?}",
+                        attempt, method, e, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                    continue;
                 }
-                return Err(backoff::Error::permanent(RpcError::JsonRpc {
+            };
+
+            // Handle JSON-RPC errors
+            if let Some(error) = json_response.error {
+                if Self::is_transient_error(error.code, &error.message) {
+                    warn!(
+                        "[attempt {}] Transient RPC error on {}: code={}, msg={} — rotating key, retrying in {:?}",
+                        attempt, method, error.code, error.message, delay
+                    );
+                    self.key_pool.rotate();
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                    continue;
+                }
+                // Permanent error — return it
+                return Err(RpcError::JsonRpc {
                     code: error.code,
                     message: error.message,
-                }));
+                });
             }
 
-            json_response
-                .result
-                .ok_or_else(|| {
-                    backoff::Error::permanent(RpcError::InvalidResponse(
-                        "Missing result in response".into(),
-                    ))
-                })
-        };
-
-        backoff::future::retry(backoff, op).await
+            // Success — extract result
+            match json_response.result {
+                Some(result) => return Ok(result),
+                None => {
+                    warn!(
+                        "[attempt {}] Missing result in response for {} — retrying in {:?}",
+                        attempt, method, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                    continue;
+                }
+            }
+        }
     }
 
-    /// Batch RPC calls (Alchemy supports up to 100 per batch)
+    /// Batch RPC calls with retry + key rotation.
     pub async fn batch_call<P: Serialize + Clone, R: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -218,48 +288,90 @@ impl EthRpcClient {
     ) -> Result<Vec<R>, RpcError> {
         let mut results = Vec::with_capacity(params_list.len());
 
-        for chunk in params_list.chunks(self.config.batch_size) {
-            // Wait for rate limit (batch counts as one request for CU purposes)
-            self.rate_limiter.until_ready().await;
+        for chunk in params_list.chunks(self.config.batch_size.max(1)) {
+            let mut delay = Duration::from_millis(self.config.base_delay_ms);
+            let max_delay = Duration::from_secs(120);
+            let mut attempt: u64 = 0;
 
-            let requests: Vec<JsonRpcRequest<'_, &P>> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, p)| JsonRpcRequest {
-                    jsonrpc: "2.0",
-                    method,
-                    params: p,
-                    id: i as u64,
-                })
-                .collect();
+            let chunk_results: Vec<R> = loop {
+                attempt += 1;
+                self.rate_limiter.until_ready().await;
 
-            let response = self
-                .client
-                .post(&self.rpc_url)
-                .json(&requests)
-                .send()
-                .await?;
+                let requests: Vec<JsonRpcRequest<'_, &P>> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| JsonRpcRequest {
+                        jsonrpc: "2.0",
+                        method,
+                        params: p,
+                        id: i as u64,
+                    })
+                    .collect();
 
-            if response.status() == 429 {
-                warn!("Batch rate limited");
-                return Err(RpcError::RateLimitExceeded);
-            }
+                let url = self.rpc_url();
 
-            let responses: Vec<JsonRpcResponse<R>> = response.json().await?;
+                let send_result = self
+                    .client
+                    .post(&url)
+                    .json(&requests)
+                    .send()
+                    .await;
 
-            // Sort by id to maintain order
-            let mut sorted_responses = responses;
-            sorted_responses.sort_by_key(|r| r.id);
+                let response = match send_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            "[batch attempt {}] Network error: {} — rotating key, retrying in {:?}",
+                            attempt, e, delay
+                        );
+                        self.key_pool.rotate();
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(max_delay);
+                        continue;
+                    }
+                };
 
-            for resp in sorted_responses {
-                if let Some(error) = resp.error {
-                    warn!("Batch item error: {} - {}", error.code, error.message);
+                if response.status().as_u16() == 429 || response.status().is_server_error() {
+                    warn!(
+                        "[batch attempt {}] HTTP {} — rotating key, retrying in {:?}",
+                        attempt, response.status(), delay
+                    );
+                    self.key_pool.rotate();
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
                     continue;
                 }
-                if let Some(result) = resp.result {
-                    results.push(result);
+
+                let responses: Vec<JsonRpcResponse<R>> = match response.json().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            "[batch attempt {}] JSON parse error: {} — retrying in {:?}",
+                            attempt, e, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(max_delay);
+                        continue;
+                    }
+                };
+
+                let mut sorted = responses;
+                sorted.sort_by_key(|r| r.id);
+
+                let mut chunk_res = Vec::new();
+                for resp in sorted {
+                    if let Some(error) = resp.error {
+                        warn!("Batch item error: {} - {}", error.code, error.message);
+                        continue;
+                    }
+                    if let Some(result) = resp.result {
+                        chunk_res.push(result);
+                    }
                 }
-            }
+                break chunk_res;
+            };
+
+            results.extend(chunk_results);
         }
 
         Ok(results)
@@ -315,13 +427,15 @@ impl EthRpcClient {
             .collect())
     }
 
-    /// Get transactions in a block range (using alchemy_getAssetTransfers for efficiency)
-    /// This is Alchemy-specific but much more efficient than scanning blocks
+    /// Get transactions in a block range using alchemy_getAssetTransfers.
+    ///
+    /// NOTE: Alchemy's API accepts `fromAddress`/`toAddress` as a **single string**,
+    /// not an array. Pass one address per call; the caller loops over addresses.
     pub async fn get_asset_transfers(
         &self,
         from_block: u64,
         to_block: u64,
-        addresses: &[String],
+        address: &str,
         direction: TransferDirection,
     ) -> Result<Vec<AssetTransfer>, RpcError> {
         let from_hex = format!("0x{:x}", from_block);
@@ -331,17 +445,17 @@ impl EthRpcClient {
             TransferDirection::From => serde_json::json!({
                 "fromBlock": from_hex,
                 "toBlock": to_hex,
-                "fromAddress": addresses,
-                "category": ["external"],
+                "fromAddress": address,
+                "category": ["external", "internal"],
                 "withMetadata": true,
                 "excludeZeroValue": true,
-                "maxCount": "0x3e8" // 1000
+                "maxCount": "0x3e8"
             }),
             TransferDirection::To => serde_json::json!({
                 "fromBlock": from_hex,
                 "toBlock": to_hex,
-                "toAddress": addresses,
-                "category": ["external"],
+                "toAddress": address,
+                "category": ["external", "internal"],
                 "withMetadata": true,
                 "excludeZeroValue": true,
                 "maxCount": "0x3e8"
@@ -353,9 +467,9 @@ impl EthRpcClient {
             .await?;
 
         debug!(
-            "Got {} transfers for {} addresses",
+            "Got {} transfers for address {}",
             response.transfers.len(),
-            addresses.len()
+            address
         );
 
         Ok(response.transfers)
@@ -399,7 +513,6 @@ impl AssetTransfer {
     pub fn value_wei(&self) -> String {
         self.value
             .map(|v| {
-                // Convert ETH to wei (multiply by 10^18)
                 let wei = v * 1e18;
                 format!("{:.0}", wei)
             })
@@ -426,5 +539,13 @@ mod tests {
 
         let wei = transfer.value_wei();
         assert_eq!(wei, "1500000000000000000");
+    }
+
+    #[test]
+    fn test_is_transient_error() {
+        assert!(EthRpcClient::is_transient_error(-32005, "rate limit exceeded"));
+        assert!(EthRpcClient::is_transient_error(-32603, "internal error"));
+        assert!(EthRpcClient::is_transient_error(0, "Rate limit reached"));
+        assert!(!EthRpcClient::is_transient_error(-32600, "invalid request"));
     }
 }

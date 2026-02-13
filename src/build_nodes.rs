@@ -40,7 +40,8 @@ pub struct NodeBuilder {
 impl NodeBuilder {
     pub fn new(config: &PipelineConfig) -> Self {
         let client = EthRpcClient::new(
-            config.alchemy_rpc_url(),
+            config.alchemy_base_url.clone(),
+            config.alchemy_key_pool.clone(),
             config.rate_limits.clone(),
         );
         Self {

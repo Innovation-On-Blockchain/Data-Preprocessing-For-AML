@@ -55,7 +55,8 @@ pub struct TransactionCollector {
 impl TransactionCollector {
     pub fn new(config: PipelineConfig) -> Self {
         let client = EthRpcClient::new(
-            config.alchemy_rpc_url(),
+            config.alchemy_base_url.clone(),
+            config.alchemy_key_pool.clone(),
             config.rate_limits.clone(),
         );
         Self { client, config }
@@ -90,9 +91,9 @@ impl TransactionCollector {
         let mut counterparty_stats: HashMap<String, HashMap<String, CounterpartyStats>> =
             HashMap::new();
 
-        // Process in chunks to avoid API limits
-        let chunk_size = 10; // Alchemy limits address array size
-        let block_chunk_size = 10000; // Process blocks in chunks
+        // Alchemy getAssetTransfers supports very large block ranges.
+        // Use 500K blocks per chunk (~70 days) to minimise API calls.
+        let block_chunk_size: u64 = 500_000;
 
         let labeled_set: HashSet<String> = labeled_addresses
             .iter()
@@ -109,52 +110,78 @@ impl TransactionCollector {
                 (block_start - start_block) as f64 / (end_block - start_block) as f64 * 100.0
             );
 
-            for addr_chunk in labeled_addresses.chunks(chunk_size) {
-                let addr_vec: Vec<String> = addr_chunk.to_vec();
-
-                // Fetch outgoing transactions (from labeled addresses)
-                let outgoing = self
+            // Alchemy accepts fromAddress/toAddress as a single string, not an array.
+            // We must loop over addresses individually.
+            for addr in labeled_addresses {
+                // Fetch outgoing transactions (from labeled address)
+                match self
                     .client
-                    .get_asset_transfers(block_start, block_end, &addr_vec, TransferDirection::From)
-                    .await?;
+                    .get_asset_transfers(block_start, block_end, addr, TransferDirection::From)
+                    .await
+                {
+                    Ok(outgoing) => {
+                        for transfer in &outgoing {
+                            if let Some(to) = &transfer.to {
+                                let to_lower = to.to_lowercase();
+                                if !labeled_set.contains(&to_lower) {
+                                    let from_lower = transfer.from.to_lowercase();
+                                    self.update_counterparty_stats(
+                                        &mut counterparty_stats,
+                                        &from_lower,
+                                        &to_lower,
+                                        transfer,
+                                    );
+                                }
+                            }
+                        }
+                        all_transactions.extend(outgoing);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch outgoing transfers for {} block range {}-{}: {} — skipping, data preserved",
+                            addr, block_start, block_end, e
+                        );
+                    }
+                }
 
-                for transfer in &outgoing {
-                    if let Some(to) = &transfer.to {
-                        let to_lower = to.to_lowercase();
-                        if !labeled_set.contains(&to_lower) {
+                // Fetch incoming transactions (to labeled address)
+                match self
+                    .client
+                    .get_asset_transfers(block_start, block_end, addr, TransferDirection::To)
+                    .await
+                {
+                    Ok(mut incoming) => {
+                        // Safety net: if Alchemy still returns to=null for the
+                        // To-direction, fill it in from the queried address.
+                        for transfer in &mut incoming {
+                            if transfer.to.as_ref().map_or(true, |t| t.is_empty()) {
+                                transfer.to = Some(addr.clone());
+                            }
+                        }
+
+                        for transfer in &incoming {
                             let from_lower = transfer.from.to_lowercase();
-                            self.update_counterparty_stats(
-                                &mut counterparty_stats,
-                                &from_lower,
-                                &to_lower,
-                                transfer,
-                            );
+                            if !labeled_set.contains(&from_lower) {
+                                if let Some(to) = &transfer.to {
+                                    let to_lower = to.to_lowercase();
+                                    self.update_counterparty_stats(
+                                        &mut counterparty_stats,
+                                        &to_lower,
+                                        &from_lower,
+                                        transfer,
+                                    );
+                                }
+                            }
                         }
+                        all_transactions.extend(incoming);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch incoming transfers for {} block range {}-{}: {} — skipping, data preserved",
+                            addr, block_start, block_end, e
+                        );
                     }
                 }
-                all_transactions.extend(outgoing);
-
-                // Fetch incoming transactions (to labeled addresses)
-                let incoming = self
-                    .client
-                    .get_asset_transfers(block_start, block_end, &addr_vec, TransferDirection::To)
-                    .await?;
-
-                for transfer in &incoming {
-                    let from_lower = transfer.from.to_lowercase();
-                    if !labeled_set.contains(&from_lower) {
-                        if let Some(to) = &transfer.to {
-                            let to_lower = to.to_lowercase();
-                            self.update_counterparty_stats(
-                                &mut counterparty_stats,
-                                &to_lower,
-                                &from_lower,
-                                transfer,
-                            );
-                        }
-                    }
-                }
-                all_transactions.extend(incoming);
             }
         }
 
@@ -282,7 +309,6 @@ impl TransactionCollector {
         let (start_block, end_block) = self.get_block_range().await?;
 
         let mut all_transactions = Vec::new();
-        let chunk_size = 10;
         let block_chunk_size = 10000;
 
         let counterparty_vec: Vec<String> = counterparties.iter().cloned().collect();
@@ -296,38 +322,60 @@ impl TransactionCollector {
 
             debug!("Processing counterparty blocks {} to {}", block_start, block_end);
 
-            for addr_chunk in counterparty_vec.chunks(chunk_size) {
-                let addr_vec: Vec<String> = addr_chunk.to_vec();
-
-                // Only fetch transactions where counterparty sends TO labeled address
-                // or receives FROM labeled address
-                let outgoing = self
+            // Alchemy accepts a single address per call.
+            for addr in &counterparty_vec {
+                // Outgoing from counterparty → keep only if destination is labeled
+                match self
                     .client
-                    .get_asset_transfers(block_start, block_end, &addr_vec, TransferDirection::From)
-                    .await?;
+                    .get_asset_transfers(block_start, block_end, addr, TransferDirection::From)
+                    .await
+                {
+                    Ok(outgoing) => {
+                        let filtered_out: Vec<_> = outgoing
+                            .into_iter()
+                            .filter(|t| {
+                                t.to.as_ref()
+                                    .map(|to| labeled_set.contains(&to.to_lowercase()))
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        all_transactions.extend(filtered_out);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch counterparty outgoing for {} block range {}-{}: {} — skipping",
+                            addr, block_start, block_end, e
+                        );
+                    }
+                }
 
-                // Filter: only keep if destination is a labeled address
-                let filtered_out: Vec<_> = outgoing
-                    .into_iter()
-                    .filter(|t| {
-                        t.to.as_ref()
-                            .map(|to| labeled_set.contains(&to.to_lowercase()))
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                all_transactions.extend(filtered_out);
-
-                let incoming = self
+                // Incoming to counterparty → keep only if source is labeled
+                match self
                     .client
-                    .get_asset_transfers(block_start, block_end, &addr_vec, TransferDirection::To)
-                    .await?;
+                    .get_asset_transfers(block_start, block_end, addr, TransferDirection::To)
+                    .await
+                {
+                    Ok(mut incoming) => {
+                        // Safety net: fill in null `to` from queried address
+                        for transfer in &mut incoming {
+                            if transfer.to.as_ref().map_or(true, |t| t.is_empty()) {
+                                transfer.to = Some(addr.clone());
+                            }
+                        }
 
-                // Filter: only keep if source is a labeled address
-                let filtered_in: Vec<_> = incoming
-                    .into_iter()
-                    .filter(|t| labeled_set.contains(&t.from.to_lowercase()))
-                    .collect();
-                all_transactions.extend(filtered_in);
+                        let filtered_in: Vec<_> = incoming
+                            .into_iter()
+                            .filter(|t| labeled_set.contains(&t.from.to_lowercase()))
+                            .collect();
+                        all_transactions.extend(filtered_in);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch counterparty incoming for {} block range {}-{}: {} — skipping",
+                            addr, block_start, block_end, e
+                        );
+                    }
+                }
             }
         }
 
@@ -344,17 +392,26 @@ impl TransactionCollector {
         &self,
         transfers: Vec<AssetTransfer>,
     ) -> Result<Vec<RawTransaction>, TransactionError> {
-        let mut transactions = Vec::with_capacity(transfers.len());
+        let total = transfers.len();
+        let mut transactions = Vec::with_capacity(total);
+        let mut skip_category = 0usize;
+        let mut skip_to_empty = 0usize;
+        let mut skip_from_empty = 0usize;
+        let mut skip_addr_empty = 0usize;
 
         for transfer in transfers {
-            // Only process ETH transfers (external category)
-            if transfer.category != "external" {
+            // Only process ETH transfers (external or internal category)
+            if transfer.category != "external" && transfer.category != "internal" {
+                skip_category += 1;
                 continue;
             }
 
             let to_address = match &transfer.to {
-                Some(to) => to.clone(),
-                None => continue, // Skip contract creations
+                Some(to) if !to.is_empty() => to.clone(),
+                _ => {
+                    skip_to_empty += 1;
+                    continue;
+                }
             };
 
             // Parse timestamp from metadata
@@ -366,6 +423,12 @@ impl TransactionCollector {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(Utc::now);
 
+            // Skip if from_address is empty
+            if transfer.from.is_empty() {
+                skip_from_empty += 1;
+                continue;
+            }
+
             // Normalize addresses
             let from = ValidatedAddress::parse(&transfer.from)
                 .map(|a| a.to_checksum())
@@ -374,6 +437,13 @@ impl TransactionCollector {
             let to = ValidatedAddress::parse(&to_address)
                 .map(|a| a.to_checksum())
                 .unwrap_or_else(|_| to_address);
+
+            // Final safety check - skip if either address is empty after normalization
+            if from.is_empty() || to.is_empty() {
+                skip_addr_empty += 1;
+                warn!("Skipping transaction with empty address: from={}, to={}", from, to);
+                continue;
+            }
 
             let value_wei = transfer.value_wei();
             transactions.push(RawTransaction {
@@ -384,6 +454,11 @@ impl TransactionCollector {
                 value_wei,
             });
         }
+
+        info!(
+            "convert_transfers: {} total -> {} kept, filtered: {} non-external, {} empty-to, {} empty-from, {} empty-after-normalize",
+            total, transactions.len(), skip_category, skip_to_empty, skip_from_empty, skip_addr_empty
+        );
 
         Ok(transactions)
     }
@@ -420,10 +495,24 @@ pub fn write_transactions_parquet(
         output_path
     );
 
+    // Filter out any transactions with empty addresses (safety net)
+    let valid: Vec<_> = transactions
+        .iter()
+        .filter(|tx| !tx.from_address.is_empty() && !tx.to_address.is_empty())
+        .collect();
+
+    let filtered_count = transactions.len() - valid.len();
+    if filtered_count > 0 {
+        warn!(
+            "Filtered {} transactions with empty addresses",
+            filtered_count
+        );
+    }
+
     // Deduplicate by tx_hash
     let mut seen = HashSet::new();
-    let deduped: Vec<_> = transactions
-        .iter()
+    let deduped: Vec<_> = valid
+        .into_iter()
         .filter(|tx| seen.insert(tx.tx_hash.clone()))
         .collect();
 

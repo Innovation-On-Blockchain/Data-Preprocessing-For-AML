@@ -2,12 +2,15 @@
 //!
 //! A production-quality pipeline for collecting and labeling Ethereum
 //! transaction data for Anti-Money Laundering (AML) analysis.
+//!
+//! Hardened to never crash/exit on transient errors — all data in memory
+//! is preserved and written to disk even when individual stages fail.
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::{info, warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use eth_aml_pipeline::aggregate_graph::{aggregate_with_large_values, read_edges_parquet};
@@ -130,8 +133,39 @@ enum Commands {
     Status,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() {
+    // Catch any panic at the top level so the process never aborts silently.
+    let result = std::panic::catch_unwind(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build Tokio runtime")
+            .block_on(async_main())
+    });
+
+    match result {
+        Ok(Ok(())) => {
+            std::process::exit(0);
+        }
+        Ok(Err(e)) => {
+            eprintln!("Pipeline error: {:#}", e);
+            std::process::exit(1);
+        }
+        Err(panic_info) => {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("FATAL PANIC (caught): {}", msg);
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -151,6 +185,11 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Failed to load config from {:?}", path))?,
         None => PipelineConfig::load().context("Failed to load config from environment")?,
     };
+
+    info!(
+        "Loaded {} Alchemy API key(s) for rotation",
+        config.alchemy_key_pool.len()
+    );
 
     // Override output directory if specified
     config.paths.data_dir = cli.output_dir.clone();
@@ -316,23 +355,38 @@ async fn cmd_fetch_transactions(
         top_k
     );
 
+    // ---- CHECKPOINT: save labeled transactions before starting counterparty fetch ----
+    // This ensures we don't lose data if the counterparty phase fails.
+    let output_path = config.paths.raw_dir.join(output);
+    info!("Checkpoint: saving {} labeled transactions to {:?}", transactions.len(), output_path);
+    if let Err(e) = write_transactions_parquet(&transactions, &output_path) {
+        error!("Checkpoint save failed (continuing): {}", e);
+    }
+
     // Collect counterparty transactions
     if !counterparties.is_empty() {
         info!("Collecting counterparty transactions...");
-        let counterparty_txs = collector
+        match collector
             .collect_counterparty_transactions(&labeled_addresses, &counterparties)
             .await
-            .context("Failed to collect counterparty transactions")?;
-
-        info!(
-            "Collected {} additional counterparty transactions",
-            counterparty_txs.len()
-        );
-        transactions.extend(counterparty_txs);
+        {
+            Ok(counterparty_txs) => {
+                info!(
+                    "Collected {} additional counterparty transactions",
+                    counterparty_txs.len()
+                );
+                transactions.extend(counterparty_txs);
+            }
+            Err(e) => {
+                error!(
+                    "Counterparty transaction collection failed: {} — saving what we have",
+                    e
+                );
+            }
+        }
     }
 
-    // Write output
-    let output_path = config.paths.raw_dir.join(output);
+    // Final write (overwrites checkpoint with full data)
     write_transactions_parquet(&transactions, &output_path)
         .context("Failed to write transactions")?;
 
@@ -596,10 +650,10 @@ fn cmd_status(config: &PipelineConfig) -> Result<()> {
 
             info!(
                 "  {} {:?}: {} records ({} KB)",
-                "✓", name, count, size_kb
+                "OK", name, count, size_kb
             );
         } else {
-            info!("  {} {}: not found", "✗", name);
+            info!("  {} {}: not found", "MISSING", name);
         }
     }
 
@@ -615,9 +669,9 @@ fn cmd_status(config: &PipelineConfig) -> Result<()> {
     for file in metadata_files {
         let path = config.paths.metadata_dir.join(file);
         if path.exists() {
-            info!("  {} {}", "✓", file);
+            info!("  OK {}", file);
         } else {
-            info!("  {} {}", "✗", file);
+            info!("  MISSING {}", file);
         }
     }
 

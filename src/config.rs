@@ -5,15 +5,72 @@
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Ethereum mainnet genesis block timestamp: July 30, 2015 15:26:13 UTC
 pub const ETHEREUM_GENESIS_TIMESTAMP: &str = "2015-07-30T15:26:13Z";
 
+/// Thread-safe rotating pool of Alchemy API keys.
+/// Rotates to the next key on every call to `rotate()` (called on 429 rate-limit).
+#[derive(Debug, Clone)]
+pub struct AlchemyKeyPool {
+    keys: Arc<Vec<String>>,
+    index: Arc<AtomicUsize>,
+}
+
+impl AlchemyKeyPool {
+    pub fn new(keys: Vec<String>) -> Self {
+        assert!(!keys.is_empty(), "At least one Alchemy API key is required");
+        Self {
+            keys: Arc::new(keys),
+            index: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Get the current active key.
+    pub fn current_key(&self) -> &str {
+        let idx = self.index.load(Ordering::SeqCst) % self.keys.len();
+        &self.keys[idx]
+    }
+
+    /// Rotate to the next key. Returns the new active key.
+    pub fn rotate(&self) -> &str {
+        let prev = self.index.fetch_add(1, Ordering::SeqCst);
+        let new_idx = (prev + 1) % self.keys.len();
+        tracing::warn!(
+            "Rotating Alchemy API key: slot {} -> slot {} (of {} keys)",
+            prev % self.keys.len(),
+            new_idx,
+            self.keys.len()
+        );
+        &self.keys[new_idx]
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+// Custom Serialize/Deserialize: serialize only the count, never the actual keys
+impl Serialize for AlchemyKeyPool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("<{} keys>", self.keys.len()))
+    }
+}
+
+impl<'de> Deserialize<'de> for AlchemyKeyPool {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        // Deserialization is handled by PipelineConfig::load(); this is a no-op fallback
+        Ok(Self::new(vec!["placeholder".to_string()]))
+    }
+}
+
 /// Main pipeline configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
-    /// Alchemy API key for Ethereum RPC
-    pub alchemy_api_key: String,
+    /// Pool of Alchemy API keys for rotation on rate-limit
+    pub alchemy_key_pool: AlchemyKeyPool,
 
     /// Base URL for Alchemy (mainnet)
     #[serde(default = "default_alchemy_url")]
@@ -366,15 +423,51 @@ pub enum ScaleCheckResult {
 }
 
 impl PipelineConfig {
+    /// Collect all ALCHEMY_API_KEY_* env vars (supports KEY_1..KEY_N and legacy KEY).
+    fn load_api_keys() -> anyhow::Result<Vec<String>> {
+        let mut keys = Vec::new();
+
+        // Try numbered keys first: ALCHEMY_API_KEY_1 .. ALCHEMY_API_KEY_99
+        for i in 1..=99 {
+            if let Ok(k) = std::env::var(format!("ALCHEMY_API_KEY_{}", i)) {
+                let k = k.trim().to_string();
+                if !k.is_empty() && !k.starts_with("YOUR_") {
+                    keys.push(k);
+                }
+            } else {
+                break; // stop at first gap
+            }
+        }
+
+        // Fallback: legacy single-key variable
+        if keys.is_empty() {
+            if let Ok(k) = std::env::var("ALCHEMY_API_KEY") {
+                let k = k.trim().to_string();
+                if !k.is_empty() && !k.starts_with("YOUR_") {
+                    keys.push(k);
+                }
+            }
+        }
+
+        if keys.is_empty() {
+            anyhow::bail!(
+                "No Alchemy API keys found. Set ALCHEMY_API_KEY_1 .. ALCHEMY_API_KEY_N \
+                 (or legacy ALCHEMY_API_KEY) in your .env file."
+            );
+        }
+
+        Ok(keys)
+    }
+
     /// Load configuration from environment and optional config file
     pub fn load() -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
 
-        let alchemy_api_key = std::env::var("ALCHEMY_API_KEY")
-            .map_err(|_| anyhow::anyhow!("ALCHEMY_API_KEY environment variable not set"))?;
+        let keys = Self::load_api_keys()?;
+        tracing::info!("Loaded {} Alchemy API key(s) for rotation", keys.len());
 
         let config = Self {
-            alchemy_api_key,
+            alchemy_key_pool: AlchemyKeyPool::new(keys),
             alchemy_base_url: std::env::var("ALCHEMY_BASE_URL")
                 .unwrap_or_else(|_| default_alchemy_url()),
             time_window: TimeWindowConfig::default(),
@@ -394,9 +487,9 @@ impl PipelineConfig {
         let contents = std::fs::read_to_string(path)?;
         let mut config: Self = ::toml::from_str(&contents)?;
 
-        // Environment variables override file settings
-        if let Ok(key) = std::env::var("ALCHEMY_API_KEY") {
-            config.alchemy_api_key = key;
+        // Always reload keys from environment (never stored in TOML)
+        if let Ok(keys) = Self::load_api_keys() {
+            config.alchemy_key_pool = AlchemyKeyPool::new(keys);
         }
         if let Ok(url) = std::env::var("ALCHEMY_BASE_URL") {
             config.alchemy_base_url = url;
@@ -405,9 +498,9 @@ impl PipelineConfig {
         Ok(config)
     }
 
-    /// Get full Alchemy RPC URL
+    /// Get full Alchemy RPC URL using the *current* active key.
     pub fn alchemy_rpc_url(&self) -> String {
-        format!("{}/{}", self.alchemy_base_url, self.alchemy_api_key)
+        format!("{}/{}", self.alchemy_base_url, self.alchemy_key_pool.current_key())
     }
 
     /// Ensure all output directories exist
