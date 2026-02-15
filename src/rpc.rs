@@ -431,6 +431,9 @@ impl EthRpcClient {
     ///
     /// NOTE: Alchemy's API accepts `fromAddress`/`toAddress` as a **single string**,
     /// not an array. Pass one address per call; the caller loops over addresses.
+    ///
+    /// Automatically paginates through all results using `pageKey`.
+    /// Safety limit of 100 pages (100K transfers) per call to prevent unbounded looping.
     pub async fn get_asset_transfers(
         &self,
         from_block: u64,
@@ -441,38 +444,76 @@ impl EthRpcClient {
         let from_hex = format!("0x{:x}", from_block);
         let to_hex = format!("0x{:x}", to_block);
 
-        let params = match direction {
-            TransferDirection::From => serde_json::json!({
-                "fromBlock": from_hex,
-                "toBlock": to_hex,
-                "fromAddress": address,
-                "category": ["external", "internal"],
-                "withMetadata": true,
-                "excludeZeroValue": true,
-                "maxCount": "0x3e8"
-            }),
-            TransferDirection::To => serde_json::json!({
-                "fromBlock": from_hex,
-                "toBlock": to_hex,
-                "toAddress": address,
-                "category": ["external", "internal"],
-                "withMetadata": true,
-                "excludeZeroValue": true,
-                "maxCount": "0x3e8"
-            }),
-        };
+        let mut all_transfers = Vec::new();
+        let mut page_key: Option<String> = None;
+        let max_pages: u32 = 100;
 
-        let response: AssetTransfersResponse = self
-            .call("alchemy_getAssetTransfers", [params])
-            .await?;
+        for page in 0..max_pages {
+            let mut params = match direction {
+                TransferDirection::From => serde_json::json!({
+                    "fromBlock": from_hex,
+                    "toBlock": to_hex,
+                    "fromAddress": address,
+                    "category": ["external", "internal"],
+                    "withMetadata": true,
+                    "excludeZeroValue": true,
+                    "maxCount": "0x3e8"
+                }),
+                TransferDirection::To => serde_json::json!({
+                    "fromBlock": from_hex,
+                    "toBlock": to_hex,
+                    "toAddress": address,
+                    "category": ["external", "internal"],
+                    "withMetadata": true,
+                    "excludeZeroValue": true,
+                    "maxCount": "0x3e8"
+                }),
+            };
 
-        debug!(
-            "Got {} transfers for address {}",
-            response.transfers.len(),
-            address
-        );
+            if let Some(ref key) = page_key {
+                params["pageKey"] = serde_json::json!(key);
+            }
 
-        Ok(response.transfers)
+            let response: AssetTransfersResponse = self
+                .call("alchemy_getAssetTransfers", [params])
+                .await?;
+
+            let page_count = response.transfers.len();
+            all_transfers.extend(response.transfers);
+
+            match response.page_key {
+                Some(key) => {
+                    debug!(
+                        "Address {} page {}: {} transfers (continuing, total so far: {})",
+                        address, page + 1, page_count, all_transfers.len()
+                    );
+                    page_key = Some(key);
+                }
+                None => {
+                    if page > 0 {
+                        debug!(
+                            "Address {} pagination complete: {} pages, {} total transfers",
+                            address, page + 1, all_transfers.len()
+                        );
+                    } else {
+                        debug!(
+                            "Got {} transfers for address {} (single page)",
+                            all_transfers.len(), address
+                        );
+                    }
+                    break;
+                }
+            }
+
+            if page == max_pages - 1 {
+                warn!(
+                    "Address {} hit pagination safety limit ({} pages, {} transfers). Some transfers may be missing.",
+                    address, max_pages, all_transfers.len()
+                );
+            }
+        }
+
+        Ok(all_transfers)
     }
 }
 

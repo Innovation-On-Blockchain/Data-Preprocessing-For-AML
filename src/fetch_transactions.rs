@@ -119,7 +119,21 @@ impl TransactionCollector {
                     .get_asset_transfers(block_start, block_end, addr, TransferDirection::From)
                     .await
                 {
-                    Ok(outgoing) => {
+                    Ok(mut outgoing) => {
+                        // Safety net: for outgoing transfers, Alchemy can
+                        // return to=null on certain internal transactions.
+                        // We cannot infer the recipient from the query
+                        // (unlike the incoming direction), so log and skip
+                        // these rather than silently dropping them.
+                        for transfer in &mut outgoing {
+                            if transfer.to.as_ref().map_or(true, |t| t.is_empty()) {
+                                warn!(
+                                    "Outgoing transfer {} from {} has null/empty 'to' field — skipping for counterparty stats",
+                                    transfer.hash, transfer.from
+                                );
+                            }
+                        }
+
                         for transfer in &outgoing {
                             if let Some(to) = &transfer.to {
                                 let to_lower = to.to_lowercase();
@@ -309,7 +323,7 @@ impl TransactionCollector {
         let (start_block, end_block) = self.get_block_range().await?;
 
         let mut all_transactions = Vec::new();
-        let block_chunk_size = 10000;
+        let block_chunk_size: u64 = 500_000;
 
         let counterparty_vec: Vec<String> = counterparties.iter().cloned().collect();
         let labeled_set: HashSet<String> = labeled_addresses
@@ -320,7 +334,7 @@ impl TransactionCollector {
         for block_start in (start_block..=end_block).step_by(block_chunk_size as usize) {
             let block_end = (block_start + block_chunk_size - 1).min(end_block);
 
-            debug!("Processing counterparty blocks {} to {}", block_start, block_end);
+            info!("Processing counterparty blocks {} to {}", block_start, block_end);
 
             // Alchemy accepts a single address per call.
             for addr in &counterparty_vec {
