@@ -326,10 +326,6 @@ impl TransactionCollector {
         let block_chunk_size: u64 = 500_000;
 
         let counterparty_vec: Vec<String> = counterparties.iter().cloned().collect();
-        let labeled_set: HashSet<String> = labeled_addresses
-            .iter()
-            .map(|a| a.to_lowercase())
-            .collect();
 
         for block_start in (start_block..=end_block).step_by(block_chunk_size as usize) {
             let block_end = (block_start + block_chunk_size - 1).min(end_block);
@@ -338,22 +334,14 @@ impl TransactionCollector {
 
             // Alchemy accepts a single address per call.
             for addr in &counterparty_vec {
-                // Outgoing from counterparty → keep only if destination is labeled
+                // Outgoing from counterparty → keep all transfers for full graph structure
                 match self
                     .client
                     .get_asset_transfers(block_start, block_end, addr, TransferDirection::From)
                     .await
                 {
                     Ok(outgoing) => {
-                        let filtered_out: Vec<_> = outgoing
-                            .into_iter()
-                            .filter(|t| {
-                                t.to.as_ref()
-                                    .map(|to| labeled_set.contains(&to.to_lowercase()))
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        all_transactions.extend(filtered_out);
+                        all_transactions.extend(outgoing);
                     }
                     Err(e) => {
                         warn!(
@@ -363,7 +351,7 @@ impl TransactionCollector {
                     }
                 }
 
-                // Incoming to counterparty → keep only if source is labeled
+                // Incoming to counterparty → keep all transfers for full graph structure
                 match self
                     .client
                     .get_asset_transfers(block_start, block_end, addr, TransferDirection::To)
@@ -377,11 +365,7 @@ impl TransactionCollector {
                             }
                         }
 
-                        let filtered_in: Vec<_> = incoming
-                            .into_iter()
-                            .filter(|t| labeled_set.contains(&t.from.to_lowercase()))
-                            .collect();
-                        all_transactions.extend(filtered_in);
+                        all_transactions.extend(incoming);
                     }
                     Err(e) => {
                         warn!(
