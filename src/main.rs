@@ -18,7 +18,8 @@ use eth_aml_pipeline::build_nodes::NodeBuilder;
 use eth_aml_pipeline::config::{PipelineConfig, ScaleCheckResult};
 use eth_aml_pipeline::fetch_labels::{read_labels_parquet, write_labels_parquet, OfacFetcher};
 use eth_aml_pipeline::fetch_transactions::{
-    read_transactions_parquet, write_transactions_parquet, TransactionCollector,
+    merge_parquet_files, read_transactions_parquet, write_transactions_parquet,
+    TransactionCollector,
 };
 use eth_aml_pipeline::schemas::RunMetadata;
 
@@ -363,19 +364,18 @@ async fn cmd_fetch_transactions(
         error!("Checkpoint save failed (continuing): {}", e);
     }
 
-    // Collect counterparty transactions
+    // Collect counterparty transactions (written incrementally to chunk files)
+    let chunks_dir = config.paths.raw_dir.join("counterparty_chunks");
+    let mut counterparty_count: usize = 0;
     if !counterparties.is_empty() {
-        info!("Collecting counterparty transactions...");
+        info!("Collecting counterparty transactions (streaming to disk)...");
         match collector
-            .collect_counterparty_transactions(&labeled_addresses, &counterparties)
+            .collect_counterparty_transactions(&counterparties, &chunks_dir)
             .await
         {
-            Ok(counterparty_txs) => {
-                info!(
-                    "Collected {} additional counterparty transactions",
-                    counterparty_txs.len()
-                );
-                transactions.extend(counterparty_txs);
+            Ok(count) => {
+                info!("Collected {} counterparty transactions in chunk files", count);
+                counterparty_count = count;
             }
             Err(e) => {
                 error!(
@@ -386,17 +386,31 @@ async fn cmd_fetch_transactions(
         }
     }
 
-    // Final write (overwrites checkpoint with full data)
-    write_transactions_parquet(&transactions, &output_path)
-        .context("Failed to write transactions")?;
+    // Drop the in-memory labeled transactions before merge (free ~labeled memory)
+    let labeled_count = transactions.len();
+    drop(transactions);
+
+    // Merge labeled checkpoint + counterparty chunks into final output
+    let total = merge_parquet_files(&output_path, &chunks_dir, &output_path)
+        .context("Failed to merge transaction files")?;
+
+    // Clean up chunk files
+    if chunks_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&chunks_dir) {
+            warn!("Failed to clean up chunk dir {:?}: {}", chunks_dir, e);
+        }
+    }
 
     // Write metadata
     let mut metadata = RunMetadata::new(config.time_window.start, config.time_window.end);
-    metadata.record_counts.raw_transactions = transactions.len();
+    metadata.record_counts.raw_transactions = total;
     let metadata_path = config.paths.metadata_dir.join("transactions_metadata.json");
     metadata.save(&metadata_path)?;
 
-    info!("Transactions saved to {:?}", output_path);
+    info!(
+        "Transactions saved to {:?} ({} labeled + {} counterparty = {} after dedup)",
+        output_path, labeled_count, counterparty_count, total
+    );
     info!("Metadata saved to {:?}", metadata_path);
 
     Ok(())

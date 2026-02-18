@@ -14,6 +14,69 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+/// Known high-volume exchange, DEX router, and wrapper contract addresses.
+/// These are excluded from counterparty expansion (phase 2) because they have
+/// millions of transactions that add noise without discriminative signal for GNN
+/// training. The labeled↔exchange edges from phase 1 are still preserved.
+fn known_exchange_addresses() -> HashSet<String> {
+    [
+        // Binance
+        "0x28c6c06298d514db089934071355e5743bf21d60",
+        "0x21a31ee1afc51d94c2efccaa2092ad1028285549",
+        "0xdfd5293d8e347dfe59e90efd55b2956a1343963d",
+        "0x56eddb7aa87536c09ccc2793473599fd21a8b17f",
+        // Bitfinex
+        "0x52bc44d5378309ee2abf1539bf71de1b7d7be3b5",
+        "0x1151314c646ce4e0efd76d1af4760ae66a9fe30f",
+        // Kraken
+        "0x2910543af39aba0cd09dbb2d50200b3e800a63d2",
+        "0x267be1c1d684f78cb4f6a176c4911b741e4ffdc0",
+        // Coinbase
+        "0x71660c4005ba85c37ccec55d0c4493e66fe775d3",
+        "0x503828976d22510aad0201ac7ec88293211d23da",
+        "0xddfabcdc4d8ffc6d5beaf154f18b778f892a0740",
+        "0x3cd751e6b0078be393132286c442345e68ff0aaa",
+        // WETH contract
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        // Uniswap V2 Router
+        "0x7a250d5630b4cf539739df2c5dacb4c659f2488d",
+        // Uniswap V3 Router
+        "0xe592427a0aece92de3edee1f18e0157c05861564",
+        "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45",
+        // LiFi Diamond (aggregator)
+        "0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae",
+        // OKX
+        "0x6cc5f688a315f3dc28a7781717a9a798a59fda7b",
+        // Gemini
+        "0xd24400ae8bfebb18ca49be86258a3c749cf46853",
+        // Huobi/HTX
+        "0xa9d1e08c7793af67e9d92fe308d5697fb81d3e43",
+        "0x46340b20830761efd32832a74d7169b29feb9758",
+        // KuCoin
+        "0x9430801ebaf509ad49202aabc5f5bc6fd8a3daf8",
+        // Crypto.com
+        "0x6262998ced04146fa42253a5c0af90ca02dfd2a3",
+        // Gate.io
+        "0x974caa59e49682cda0ad2bbe82983419a2ecc400",
+        "0x4976a4a02f38326660d17bf34b431dc6e2eb2327",
+        // Bittrex
+        "0xfbb1b73c4f0bda4f67dca266ce6ef42f520fbb98",
+        // Poloniex
+        "0x209c4784ab1e8183cf58ca33cb740efbf3fc18ef",
+        // Aave V2 Lending Pool
+        "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9",
+        // Aave V3 Pool
+        "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2",
+        // 1inch Router
+        "0x1111111254eeb25477b68fb85ed929f73a960582",
+        // Metamask Swap Router
+        "0x881d40237659c251811cec9c364ef91dc08d300c",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 #[derive(Error, Debug)]
 pub enum TransactionError {
     #[error("RPC error: {0}")]
@@ -233,6 +296,20 @@ impl TransactionCollector {
             );
         }
 
+        // Remove known exchanges/hubs — they add noise without GNN signal.
+        // Their direct edges to labeled addresses are already captured in phase 1.
+        let exchanges = known_exchange_addresses();
+        let before_filter = selected_counterparties.len();
+        selected_counterparties.retain(|addr| !exchanges.contains(&addr.to_lowercase()));
+        let removed = before_filter - selected_counterparties.len();
+        if removed > 0 {
+            info!(
+                "Filtered out {} known exchange/hub addresses from counterparty set ({} remaining)",
+                removed,
+                selected_counterparties.len()
+            );
+        }
+
         // Check scale limits
         let total_counterparties = selected_counterparties.len();
         if total_counterparties > self.config.scale.max_nodes {
@@ -304,15 +381,16 @@ impl TransactionCollector {
         }
     }
 
-    /// Collect transactions involving 1-hop counterparties
-    /// Only collects transactions TO/FROM labeled addresses (not between counterparties)
+    /// Collect transactions involving 1-hop counterparties.
+    /// Writes chunk parquet files to `chunks_dir` to avoid OOM on large datasets.
+    /// Returns the total number of transactions written across all chunks.
     pub async fn collect_counterparty_transactions(
         &self,
-        labeled_addresses: &[String],
         counterparties: &HashSet<String>,
-    ) -> Result<Vec<RawTransaction>, TransactionError> {
+        chunks_dir: &Path,
+    ) -> Result<usize, TransactionError> {
         if counterparties.is_empty() {
-            return Ok(Vec::new());
+            return Ok(0);
         }
 
         info!(
@@ -320,10 +398,13 @@ impl TransactionCollector {
             counterparties.len()
         );
 
+        std::fs::create_dir_all(chunks_dir)?;
+
         let (start_block, end_block) = self.get_block_range().await?;
 
-        let mut all_transactions = Vec::new();
+        let mut total_written: usize = 0;
         let block_chunk_size: u64 = 500_000;
+        let mut chunk_index: u32 = 0;
 
         let counterparty_vec: Vec<String> = counterparties.iter().cloned().collect();
 
@@ -331,6 +412,8 @@ impl TransactionCollector {
             let block_end = (block_start + block_chunk_size - 1).min(end_block);
 
             info!("Processing counterparty blocks {} to {}", block_start, block_end);
+
+            let mut chunk_transfers = Vec::new();
 
             // Alchemy accepts a single address per call.
             for addr in &counterparty_vec {
@@ -341,7 +424,7 @@ impl TransactionCollector {
                     .await
                 {
                     Ok(outgoing) => {
-                        all_transactions.extend(outgoing);
+                        chunk_transfers.extend(outgoing);
                     }
                     Err(e) => {
                         warn!(
@@ -365,7 +448,7 @@ impl TransactionCollector {
                             }
                         }
 
-                        all_transactions.extend(incoming);
+                        chunk_transfers.extend(incoming);
                     }
                     Err(e) => {
                         warn!(
@@ -375,14 +458,29 @@ impl TransactionCollector {
                     }
                 }
             }
+
+            // Convert and flush this chunk to disk
+            if !chunk_transfers.is_empty() {
+                let raw_txs = self.convert_transfers(chunk_transfers)?;
+                let chunk_path = chunks_dir.join(format!("chunk_{:04}.parquet", chunk_index));
+                write_transactions_parquet(&raw_txs, &chunk_path)?;
+                total_written += raw_txs.len();
+                info!(
+                    "Flushed chunk {} ({} txs, {} total so far)",
+                    chunk_index,
+                    raw_txs.len(),
+                    total_written
+                );
+                chunk_index += 1;
+            }
         }
 
         info!(
-            "Found {} counterparty transactions to/from labeled addresses",
-            all_transactions.len()
+            "Counterparty collection complete: {} transactions in {} chunks",
+            total_written, chunk_index
         );
 
-        self.convert_transfers(all_transactions)
+        Ok(total_written)
     }
 
     /// Convert Alchemy transfers to RawTransaction format
@@ -549,6 +647,85 @@ pub fn write_transactions_parquet(
 
     info!("Successfully wrote transactions to {:?}", output_path);
     Ok(())
+}
+
+/// Merge the labeled-transactions checkpoint with counterparty chunk files into
+/// a single deduplicated parquet file. Operates at the DataFrame level to avoid
+/// loading all rows into Rust structs simultaneously.
+pub fn merge_parquet_files(
+    labeled_path: &Path,
+    chunks_dir: &Path,
+    output_path: &Path,
+) -> Result<usize, TransactionError> {
+    let mut frames: Vec<DataFrame> = Vec::new();
+
+    // Read labeled transactions checkpoint
+    if labeled_path.exists() {
+        let file = std::fs::File::open(labeled_path)?;
+        let df = ParquetReader::new(file).finish()?;
+        info!("Loaded {} labeled transactions from checkpoint", df.height());
+        frames.push(df);
+    }
+
+    // Read all chunk files
+    if chunks_dir.exists() {
+        let mut chunk_files: Vec<_> = std::fs::read_dir(chunks_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "parquet")
+            })
+            .collect();
+        chunk_files.sort_by_key(|e| e.path());
+
+        for entry in &chunk_files {
+            let file = std::fs::File::open(entry.path())?;
+            let df = ParquetReader::new(file).finish()?;
+            info!("Loaded chunk {:?} ({} rows)", entry.path().file_name().unwrap(), df.height());
+            frames.push(df);
+        }
+    }
+
+    if frames.is_empty() {
+        info!("No parquet files to merge");
+        return Ok(0);
+    }
+
+    // Concatenate all frames
+    let mut combined = frames
+        .into_iter()
+        .reduce(|a, b| a.vstack(&b).expect("Schema mismatch during merge"))
+        .unwrap();
+
+    let total_before = combined.height();
+
+    // Deduplicate by tx_hash
+    combined = combined.unique(Some(&["tx_hash".to_string()]), UniqueKeepStrategy::First, None)?;
+
+    let total_after = combined.height();
+    let dupes = total_before - total_after;
+    if dupes > 0 {
+        info!("Removed {} duplicate transactions during merge", dupes);
+    }
+
+    // Sort by timestamp, then tx_hash for determinism
+    combined = combined.sort(
+        ["block_timestamp", "tx_hash"],
+        SortMultipleOptions::default(),
+    )?;
+
+    let file = std::fs::File::create(output_path)?;
+    ParquetWriter::new(file)
+        .with_compression(ParquetCompression::Zstd(None))
+        .finish(&mut combined)?;
+
+    info!(
+        "Merged {} transactions to {:?}",
+        total_after, output_path
+    );
+
+    Ok(total_after)
 }
 
 /// Read transactions from Parquet
