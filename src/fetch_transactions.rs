@@ -701,7 +701,7 @@ pub fn merge_parquet_files(
     let total_before = combined.height();
 
     // Deduplicate by tx_hash
-    combined = combined.unique(Some(&["tx_hash".to_string()]), UniqueKeepStrategy::First, None)?;
+    combined = combined.unique(Some(&["tx_hash".to_string()]), UniqueKeepStrategy::First, None::<polars::prelude::PlSmallStr>)?;
 
     let total_after = combined.height();
     let dupes = total_before - total_after;
