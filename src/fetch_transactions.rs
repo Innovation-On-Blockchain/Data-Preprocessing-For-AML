@@ -9,10 +9,22 @@ use crate::rpc::{AssetTransfer, EthRpcClient, TransferDirection};
 use crate::schemas::RawTransaction;
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+/// Progress checkpoint for resumable counterparty collection.
+#[derive(Serialize, Deserialize)]
+struct ChunkProgress {
+    /// Next block to start processing from.
+    next_block_start: u64,
+    /// Next chunk file index to write.
+    next_chunk_index: u32,
+    /// Running total of transactions written so far.
+    total_written: usize,
+}
 
 /// Known high-volume exchange, DEX router, and wrapper contract addresses.
 /// These are excluded from counterparty expansion (phase 2) because they have
@@ -402,13 +414,35 @@ impl TransactionCollector {
 
         let (start_block, end_block) = self.get_block_range().await?;
 
-        let mut total_written: usize = 0;
         let block_chunk_size: u64 = 500_000;
-        let mut chunk_index: u32 = 0;
+
+        // Resume from progress checkpoint if one exists (crash recovery).
+        let progress_path = chunks_dir.join("progress.json");
+        let (mut chunk_index, mut total_written, resume_block) =
+            match std::fs::read_to_string(&progress_path) {
+                Ok(json) => match serde_json::from_str::<ChunkProgress>(&json) {
+                    Ok(p) => {
+                        info!(
+                            "Resuming counterparty collection from block {} (chunk {}, {} txs already on disk)",
+                            p.next_block_start, p.next_chunk_index, p.total_written
+                        );
+                        (p.next_chunk_index, p.total_written, p.next_block_start)
+                    }
+                    Err(e) => {
+                        warn!("Corrupt progress file, starting from scratch: {}", e);
+                        (0u32, 0usize, start_block)
+                    }
+                },
+                Err(_) => (0u32, 0usize, start_block),
+            };
 
         let counterparty_vec: Vec<String> = counterparties.iter().cloned().collect();
 
         for block_start in (start_block..=end_block).step_by(block_chunk_size as usize) {
+            if block_start < resume_block {
+                continue;
+            }
+
             let block_end = (block_start + block_chunk_size - 1).min(end_block);
 
             info!("Processing counterparty blocks {} to {}", block_start, block_end);
@@ -472,7 +506,24 @@ impl TransactionCollector {
                     total_written
                 );
                 chunk_index += 1;
+
+                // Save progress checkpoint so we can resume after a crash.
+                let progress = ChunkProgress {
+                    next_block_start: block_start + block_chunk_size,
+                    next_chunk_index: chunk_index,
+                    total_written,
+                };
+                if let Ok(json) = serde_json::to_string(&progress) {
+                    if let Err(e) = std::fs::write(&progress_path, json) {
+                        warn!("Failed to write progress checkpoint: {}", e);
+                    }
+                }
             }
+        }
+
+        // Remove progress file on successful completion.
+        if progress_path.exists() {
+            std::fs::remove_file(&progress_path).ok();
         }
 
         info!(
