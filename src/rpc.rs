@@ -392,6 +392,9 @@ impl EthRpcClient {
             };
 
             results.extend(chunk_results);
+
+            // Proactively advance to next key for even load distribution.
+            self.key_pool.advance();
         }
 
         Ok(results)

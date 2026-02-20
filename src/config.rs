@@ -34,7 +34,7 @@ impl AlchemyKeyPool {
         &self.keys[idx]
     }
 
-    /// Rotate to the next key. Returns the new active key.
+    /// Rotate to the next key (logs a warning). Returns the new active key.
     pub fn rotate(&self) -> &str {
         let prev = self.index.fetch_add(1, Ordering::SeqCst);
         let new_idx = (prev + 1) % self.keys.len();
@@ -45,6 +45,11 @@ impl AlchemyKeyPool {
             self.keys.len()
         );
         &self.keys[new_idx]
+    }
+
+    /// Advance to the next key silently (for proactive round-robin, no warning).
+    pub fn advance(&self) {
+        self.index.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn len(&self) -> usize {
@@ -214,7 +219,7 @@ fn default_alchemy_url() -> String {
 }
 
 fn default_rps() -> u32 {
-    2 // ~1 batch per key every 5s with 10 keys; avoids 429s on free-tier accounts
+    10 // With 10 keys and small batches, each key sees ~1 req/s
 }
 
 fn default_batch_size() -> usize {

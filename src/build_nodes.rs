@@ -279,7 +279,8 @@ impl NodeBuilder {
         let mut cache_writer = std::io::BufWriter::new(cache_file);
 
         // Batch detect contracts
-        let batch_size = 50;
+        // eth_getCode = 26 CU each. 18 × 26 = 468 CU per batch, under Alchemy's 500 CU/s limit.
+        let batch_size = 18;
         let total_batches = (valid_addresses.len() + batch_size - 1) / batch_size;
 
         for (batch_idx, chunk) in valid_addresses.chunks(batch_size).enumerate() {
