@@ -214,7 +214,7 @@ fn default_alchemy_url() -> String {
 }
 
 fn default_rps() -> u32 {
-    10 // Conservative to avoid 429 errors on large-scale collection
+    2 // ~1 batch per key every 5s with 10 keys; avoids 429s on free-tier accounts
 }
 
 fn default_batch_size() -> usize {
