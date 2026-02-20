@@ -106,10 +106,10 @@ enum Commands {
         #[arg(long)]
         offline: bool,
 
-        /// Path to CSV of known contract addresses (one address per line).
+        /// Directory containing CSV files of known contract addresses.
         /// Use this instead of RPC-based detection for fast local lookups.
         #[arg(long)]
-        contracts_csv: Option<PathBuf>,
+        contracts_dir: Option<PathBuf>,
     },
 
     /// Run the complete pipeline
@@ -231,9 +231,9 @@ async fn async_main() -> Result<()> {
             labels,
             output,
             offline,
-            contracts_csv,
+            contracts_dir,
         } => {
-            cmd_build_nodes(&config, &edges, &labels, &output, offline, contracts_csv.as_deref()).await?;
+            cmd_build_nodes(&config, &edges, &labels, &output, offline, contracts_dir.as_deref()).await?;
         }
         Commands::Run {
             weeks,
@@ -455,7 +455,7 @@ async fn cmd_build_nodes(
     labels_path: &PathBuf,
     output: &str,
     offline: bool,
-    contracts_csv: Option<&Path>,
+    contracts_dir: Option<&Path>,
 ) -> Result<()> {
     info!("=== Building Node Metadata ===");
 
@@ -466,9 +466,9 @@ async fn cmd_build_nodes(
         );
     }
 
-    let builder = if let Some(csv_path) = contracts_csv {
-        info!("Using local contracts CSV: {:?}", csv_path);
-        NodeBuilder::from_contracts_csv(csv_path, config.aggregation.hub_percentile)?
+    let builder = if let Some(dir_path) = contracts_dir {
+        info!("Using local contracts directory: {:?}", dir_path);
+        NodeBuilder::from_contracts_dir(dir_path, config.aggregation.hub_percentile)?
     } else if offline {
         info!("Running in offline mode (skipping contract detection)");
         NodeBuilder::offline(config.aggregation.hub_percentile)

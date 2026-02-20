@@ -63,26 +63,55 @@ impl NodeBuilder {
         }
     }
 
-    /// Create a builder that uses a local CSV of contract addresses.
-    /// The CSV should have one address per line (with or without a header).
-    pub fn from_contracts_csv(csv_path: &Path, hub_percentile: f64) -> Result<Self, NodeError> {
+    /// Create a builder that loads contract addresses from all CSV files in a directory.
+    /// Each CSV should have an address column (lines starting with `0x` are treated as addresses).
+    pub fn from_contracts_dir(dir_path: &Path, hub_percentile: f64) -> Result<Self, NodeError> {
         use std::io::{BufRead, BufReader};
 
-        let file = std::fs::File::open(csv_path)?;
-        let reader = BufReader::new(file);
-
         let mut contracts = HashSet::new();
-        for line in reader.lines() {
-            let line = line?;
-            let addr = line.trim().to_lowercase();
-            // Skip header rows or empty lines
-            if addr.is_empty() || !addr.starts_with("0x") {
-                continue;
+        let mut file_count = 0usize;
+
+        let mut entries: Vec<_> = std::fs::read_dir(dir_path)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "csv")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.path());
+
+        for entry in &entries {
+            let file = std::fs::File::open(entry.path())?;
+            let reader = BufReader::new(file);
+
+            for line in reader.lines() {
+                let line = line?;
+                // CSV rows may be: just an address, or "address,..." columns.
+                // Take the first comma-separated field.
+                let field = line.split(',').next().unwrap_or("").trim().to_lowercase();
+                if field.starts_with("0x") && field.len() == 42 {
+                    contracts.insert(field);
+                }
             }
-            contracts.insert(addr);
+            file_count += 1;
+
+            if file_count % 20 == 0 {
+                info!(
+                    "Loaded {}/{} CSV files ({} addresses so far)",
+                    file_count,
+                    entries.len(),
+                    contracts.len()
+                );
+            }
         }
 
-        info!("Loaded {} contract addresses from {:?}", contracts.len(), csv_path);
+        info!(
+            "Loaded {} contract addresses from {} CSV files in {:?}",
+            contracts.len(),
+            file_count,
+            dir_path
+        );
 
         Ok(Self {
             client: None,
