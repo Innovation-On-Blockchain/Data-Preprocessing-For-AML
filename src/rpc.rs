@@ -358,6 +358,26 @@ impl EthRpcClient {
                 let mut sorted = responses;
                 sorted.sort_by_key(|r| r.id);
 
+                // Check if any batch items have rate-limit errors — if so,
+                // retry the entire batch with key rotation instead of
+                // silently dropping those results.
+                let has_rate_limit = sorted.iter().any(|r| {
+                    r.error.as_ref().map_or(false, |e| {
+                        e.code == 429 || Self::is_transient_error(e.code, &e.message)
+                    })
+                });
+                if has_rate_limit {
+                    let rate_count = sorted.iter().filter(|r| r.error.is_some()).count();
+                    warn!(
+                        "[batch attempt {}] {} of {} items hit rate limit — rotating key, retrying in {:?}",
+                        attempt, rate_count, sorted.len(), delay
+                    );
+                    self.key_pool.rotate();
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                    continue;
+                }
+
                 let mut chunk_res = Vec::new();
                 for resp in sorted {
                     if let Some(error) = resp.error {
