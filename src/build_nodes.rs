@@ -180,7 +180,37 @@ impl NodeBuilder {
         Ok(result)
     }
 
-    /// Detect which addresses are contracts using eth_getCode
+    /// Load cached contract detection results from disk.
+    fn load_contract_cache(cache_path: &Path) -> HashMap<String, bool> {
+        match std::fs::read_to_string(cache_path) {
+            Ok(contents) => {
+                let mut cache = HashMap::new();
+                for line in contents.lines() {
+                    if let Some((addr, val)) = line.split_once(',') {
+                        cache.insert(addr.to_string(), val == "1");
+                    }
+                }
+                info!("Loaded {} cached contract detection results", cache.len());
+                cache
+            }
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Append a batch of results to the cache file.
+    fn append_contract_cache(
+        cache_file: &mut std::io::BufWriter<std::fs::File>,
+        entries: &[(String, bool)],
+    ) {
+        use std::io::Write;
+        for (addr, is_contract) in entries {
+            let _ = writeln!(cache_file, "{},{}", addr, if *is_contract { "1" } else { "0" });
+        }
+        let _ = cache_file.flush();
+    }
+
+    /// Detect which addresses are contracts using eth_getCode.
+    /// Results are cached to `data/metadata/contract_cache.csv` for resumability.
     async fn detect_contracts(
         &self,
         addresses: &HashSet<String>,
@@ -201,11 +231,36 @@ impl NodeBuilder {
 
         info!("Detecting contracts for {} addresses...", addresses.len());
 
+        // Load cached results from previous runs.
+        let cache_path = Path::new("data/metadata/contract_cache.csv");
+        let cached = Self::load_contract_cache(cache_path);
+
+        // Separate already-cached from uncached addresses.
+        let mut need_query: Vec<String> = Vec::new();
+        for addr in addresses {
+            if let Some(&val) = cached.get(addr) {
+                result.insert(addr.clone(), val);
+            } else {
+                need_query.push(addr.clone());
+            }
+        }
+
+        if need_query.is_empty() {
+            info!("All {} addresses found in cache, skipping RPC calls", result.len());
+            return Ok(result);
+        }
+
+        info!(
+            "{} addresses cached, {} remaining to query via RPC",
+            result.len(),
+            need_query.len()
+        );
+
         // Convert to alloy addresses
         let mut addr_map: HashMap<Address, String> = HashMap::new();
         let mut valid_addresses: Vec<Address> = Vec::new();
 
-        for addr_str in addresses {
+        for addr_str in &need_query {
             if let Ok(_validated) = ValidatedAddress::parse(addr_str) {
                 let alloy_addr: Address = addr_str.parse().unwrap_or_default();
                 addr_map.insert(alloy_addr, addr_str.clone());
@@ -216,36 +271,50 @@ impl NodeBuilder {
             }
         }
 
+        // Open cache file for appending new results.
+        let cache_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cache_path)?;
+        let mut cache_writer = std::io::BufWriter::new(cache_file);
+
         // Batch detect contracts
         let batch_size = 50;
         let total_batches = (valid_addresses.len() + batch_size - 1) / batch_size;
 
         for (batch_idx, chunk) in valid_addresses.chunks(batch_size).enumerate() {
-            if batch_idx % 10 == 0 {
-                debug!(
-                    "Contract detection batch {}/{} ({:.1}%)",
-                    batch_idx + 1,
+            if batch_idx % 1000 == 0 {
+                info!(
+                    "Contract detection progress: {}/{} batches ({:.1}%), {} addresses resolved",
+                    batch_idx,
                     total_batches,
-                    (batch_idx as f64 / total_batches as f64) * 100.0
+                    (batch_idx as f64 / total_batches as f64) * 100.0,
+                    result.len()
                 );
             }
 
             match client.batch_get_code(chunk).await {
                 Ok(codes) => {
+                    let mut new_entries = Vec::new();
                     for (addr, is_contract) in codes {
                         if let Some(addr_str) = addr_map.get(&addr) {
                             result.insert(addr_str.clone(), is_contract);
+                            new_entries.push((addr_str.clone(), is_contract));
                         }
                     }
+                    Self::append_contract_cache(&mut cache_writer, &new_entries);
                 }
                 Err(e) => {
                     warn!("Batch contract detection failed: {}", e);
                     // Fall back to individual queries or mark as unknown
+                    let mut new_entries = Vec::new();
                     for addr in chunk {
                         if let Some(addr_str) = addr_map.get(addr) {
                             result.insert(addr_str.clone(), false);
+                            new_entries.push((addr_str.clone(), false));
                         }
                     }
+                    Self::append_contract_cache(&mut cache_writer, &new_entries);
                 }
             }
         }
