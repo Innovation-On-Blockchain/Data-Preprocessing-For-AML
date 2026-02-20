@@ -34,6 +34,9 @@ pub enum NodeError {
 /// Node metadata builder
 pub struct NodeBuilder {
     client: Option<EthRpcClient>,
+    /// Pre-loaded set of known contract addresses (from CSV). When present,
+    /// `detect_contracts` does a local HashSet lookup instead of RPC calls.
+    known_contracts: Option<HashSet<String>>,
     hub_percentile: f64,
 }
 
@@ -46,6 +49,7 @@ impl NodeBuilder {
         );
         Self {
             client: Some(client),
+            known_contracts: None,
             hub_percentile: config.aggregation.hub_percentile,
         }
     }
@@ -54,8 +58,37 @@ impl NodeBuilder {
     pub fn offline(hub_percentile: f64) -> Self {
         Self {
             client: None,
+            known_contracts: None,
             hub_percentile,
         }
+    }
+
+    /// Create a builder that uses a local CSV of contract addresses.
+    /// The CSV should have one address per line (with or without a header).
+    pub fn from_contracts_csv(csv_path: &Path, hub_percentile: f64) -> Result<Self, NodeError> {
+        use std::io::{BufRead, BufReader};
+
+        let file = std::fs::File::open(csv_path)?;
+        let reader = BufReader::new(file);
+
+        let mut contracts = HashSet::new();
+        for line in reader.lines() {
+            let line = line?;
+            let addr = line.trim().to_lowercase();
+            // Skip header rows or empty lines
+            if addr.is_empty() || !addr.starts_with("0x") {
+                continue;
+            }
+            contracts.insert(addr);
+        }
+
+        info!("Loaded {} contract addresses from {:?}", contracts.len(), csv_path);
+
+        Ok(Self {
+            client: None,
+            known_contracts: Some(contracts),
+            hub_percentile,
+        })
     }
 
     /// Build node metadata from edges and labels files
@@ -209,13 +242,33 @@ impl NodeBuilder {
         let _ = cache_file.flush();
     }
 
-    /// Detect which addresses are contracts using eth_getCode.
-    /// Results are cached to `data/metadata/contract_cache.csv` for resumability.
+    /// Detect which addresses are contracts.
+    /// Uses local CSV lookup if available, otherwise falls back to eth_getCode RPC calls
+    /// with disk caching for resumability.
     async fn detect_contracts(
         &self,
         addresses: &HashSet<String>,
     ) -> Result<HashMap<String, bool>, NodeError> {
         let mut result = HashMap::new();
+
+        // Fast path: local CSV-based lookup (no RPC calls).
+        if let Some(known) = &self.known_contracts {
+            let mut contract_count = 0usize;
+            for addr in addresses {
+                let is_contract = known.contains(&addr.to_lowercase());
+                if is_contract {
+                    contract_count += 1;
+                }
+                result.insert(addr.clone(), is_contract);
+            }
+            info!(
+                "Local contract lookup complete: {} contracts, {} EOAs (from {} known contracts)",
+                contract_count,
+                addresses.len() - contract_count,
+                known.len()
+            );
+            return Ok(result);
+        }
 
         let client = match &self.client {
             Some(c) => c,

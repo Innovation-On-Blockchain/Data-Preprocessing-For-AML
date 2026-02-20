@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -105,6 +105,11 @@ enum Commands {
         /// Run in offline mode (skip contract detection)
         #[arg(long)]
         offline: bool,
+
+        /// Path to CSV of known contract addresses (one address per line).
+        /// Use this instead of RPC-based detection for fast local lookups.
+        #[arg(long)]
+        contracts_csv: Option<PathBuf>,
     },
 
     /// Run the complete pipeline
@@ -226,8 +231,9 @@ async fn async_main() -> Result<()> {
             labels,
             output,
             offline,
+            contracts_csv,
         } => {
-            cmd_build_nodes(&config, &edges, &labels, &output, offline).await?;
+            cmd_build_nodes(&config, &edges, &labels, &output, offline, contracts_csv.as_deref()).await?;
         }
         Commands::Run {
             weeks,
@@ -449,6 +455,7 @@ async fn cmd_build_nodes(
     labels_path: &PathBuf,
     output: &str,
     offline: bool,
+    contracts_csv: Option<&Path>,
 ) -> Result<()> {
     info!("=== Building Node Metadata ===");
 
@@ -459,7 +466,10 @@ async fn cmd_build_nodes(
         );
     }
 
-    let builder = if offline {
+    let builder = if let Some(csv_path) = contracts_csv {
+        info!("Using local contracts CSV: {:?}", csv_path);
+        NodeBuilder::from_contracts_csv(csv_path, config.aggregation.hub_percentile)?
+    } else if offline {
         info!("Running in offline mode (skipping contract detection)");
         NodeBuilder::offline(config.aggregation.hub_percentile)
     } else {
@@ -525,7 +535,7 @@ async fn cmd_run_pipeline(
         info!("\n--- Step 4: Skipping node building ---");
     } else {
         info!("\n--- Step 4: Build Node Metadata ---");
-        cmd_build_nodes(config, &edges_path, &labels_path, "nodes.parquet", false).await?;
+        cmd_build_nodes(config, &edges_path, &labels_path, "nodes.parquet", false, None).await?;
     }
 
     // Step 5: Scale validation
